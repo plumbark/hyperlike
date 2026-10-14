@@ -64,6 +64,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
+import androidx.activity.SystemBarStyle
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
 
 // Values below come from HyperOS Home's own resources (com.miui.home 6.01.02):
 // default_icon_size=60dp, icon_corner_radius_standard=13.4dp, config_cell_count_x=4, _y=6,
@@ -78,7 +87,12 @@ class MainActivity : ComponentActivity() {
     private val homeTick = mutableIntStateOf(0)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        // light nav/status icons over the wallpaper, no forced scrim behind the gesture handle / 3-button bar
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        )
+        window.isNavigationBarContrastEnforced = false
         setContent { Launcher(homeTick.intValue) }
     }
     override fun onNewIntent(intent: Intent) {
@@ -138,8 +152,39 @@ fun expandShade(ctx: Context) {
     } catch (_: Throwable) {}
 }
 
+class DragState {
+    var app by mutableStateOf<App?>(null)
+    var pos by mutableStateOf(Offset.Zero)
+    var moved by mutableStateOf(false)
+    var src = ""
+    var srcBounds = Rect.Zero
+    var blockTap = false
+    var onEnd: (App) -> Unit = {}
+    fun end() { app?.let { onEnd(it) }; app = null }
+}
+
+fun appKey(a: App) = a.pkg + "/" + a.cls
+
+fun mergeLayout(saved: List<String>, apps: List<App>): List<App> {
+    val byKey = apps.associateBy { appKey(it) }
+    val ordered = saved.mapNotNull { byKey[it] }
+    val seen = ordered.map { appKey(it) }.toSet()
+    return ordered + apps.filter { appKey(it) !in seen }
+}
+
+fun moveApp(l: List<App>, a: App, t: App): List<App> {
+    val m = l.toMutableList(); val to = l.indexOf(t); m.remove(a); m.add(to.coerceIn(0, m.size), a); return m
+}
+
+fun moveAfter(l: List<App>, a: App, t: App): List<App> {
+    val m = l.toMutableList(); m.remove(a); m.add(m.indexOf(t) + 1, a); return m
+}
+
 @Composable
-fun AppCell(app: App, modifier: Modifier = Modifier, showLabel: Boolean = true) {
+fun AppCell(
+    app: App, drag: DragState, source: String, modifier: Modifier = Modifier,
+    showLabel: Boolean = true, cellBounds: MutableMap<String, Rect>? = null
+) {
     val ctx = LocalContext.current
     val view = LocalView.current
     var pressed by remember { mutableStateOf(false) }
@@ -148,19 +193,32 @@ fun AppCell(app: App, modifier: Modifier = Modifier, showLabel: Boolean = true) 
         if (pressed) 0.88f else 1f,
         spring(dampingRatio = 0.6f, stiffness = Spring.StiffnessMedium), label = "press"
     )
+    val k = appKey(app)
+    DisposableEffect(k) { onDispose { cellBounds?.remove(k) } }
+    val lifted = drag.app?.let { appKey(it) == k } == true && drag.moved
     Box(
         modifier
-            .onGloballyPositioned { bounds = it.boundsInRoot() }
+            .onGloballyPositioned { bounds = it.boundsInRoot(); cellBounds?.put(k, bounds) }
             .pointerInput(app) {
                 detectTapGestures(
-                    onPress = { pressed = true; tryAwaitRelease(); pressed = false },
-                    onTap = { launchApp(ctx, view, app, bounds) },
-                    onLongPress = {
-                        ctx.startActivity(
-                            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${app.pkg}"))
-                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        )
-                    }
+                    onPress = { drag.blockTap = false; pressed = true; tryAwaitRelease(); pressed = false },
+                    onTap = { if (!drag.blockTap) launchApp(ctx, view, app, bounds) }
+                )
+            }
+            .pointerInput(app) {
+                var total = Offset.Zero
+                detectDragGesturesAfterLongPress(
+                    onDragStart = { o ->
+                        total = Offset.Zero
+                        drag.blockTap = true; drag.src = source; drag.srcBounds = bounds
+                        drag.moved = false; drag.pos = bounds.topLeft + o; drag.app = app
+                    },
+                    onDrag = { c, d ->
+                        c.consume(); total += d; drag.pos += d
+                        if (total.getDistance() > 12.dp.toPx()) drag.moved = true
+                    },
+                    onDragEnd = { drag.end() },
+                    onDragCancel = { drag.app = null }
                 )
             },
         contentAlignment = Alignment.Center
@@ -168,7 +226,9 @@ fun AppCell(app: App, modifier: Modifier = Modifier, showLabel: Boolean = true) 
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Image(
                 app.icon, null,
-                Modifier.size(ICON_DP.dp).graphicsLayer { scaleX = scale; scaleY = scale }
+                Modifier.size(ICON_DP.dp).graphicsLayer {
+                    scaleX = scale; scaleY = scale; alpha = if (lifted) 0.25f else 1f
+                }
             )
             if (showLabel) {
                 Spacer(Modifier.height(6.dp))
@@ -186,23 +246,78 @@ fun AppCell(app: App, modifier: Modifier = Modifier, showLabel: Boolean = true) 
 }
 
 @Composable
+fun MenuItem(t: String, onClick: () -> Unit) {
+    BasicText(
+        t,
+        Modifier.clickable(onClick = onClick).padding(horizontal = 22.dp, vertical = 12.dp).widthIn(min = 140.dp),
+        style = TextStyle(color = Color.White, fontSize = 15.sp)
+    )
+}
+
+@Composable
 fun Launcher(homeTick: Int) {
     val ctx = LocalContext.current
     val act = ctx as Activity
     val density = LocalDensity.current
+    val conf = LocalConfiguration.current
     val iconPx = with(density) { ICON_DP.dp.roundToPx() }
 
     var apps by remember { mutableStateOf<List<App>>(emptyList()) }
     LaunchedEffect(Unit) { apps = withContext(Dispatchers.Default) { loadApps(ctx, iconPx) } }
 
+    val prefs = remember { ctx.getSharedPreferences("layout", Context.MODE_PRIVATE) }
+    var layout by remember(apps) {
+        mutableStateOf(mergeLayout(prefs.getString("order", "").orEmpty().split("\n").filter { it.isNotEmpty() }, apps))
+    }
     val dockPkgs = remember { dockPackages(ctx) }
     val dock = remember(apps) { dockPkgs.mapNotNull { p -> apps.firstOrNull { it.pkg == p } }.distinctBy { it.pkg }.take(4) }
-    val pages = remember(apps) { apps.filter { it !in dock }.chunked(CELLS_X * CELLS_Y) }
+    val pages = remember(layout, dock) {
+        val dk = dock.map { appKey(it) }.toSet()
+        layout.filter { appKey(it) !in dk }.chunked(CELLS_X * CELLS_Y)
+    }
 
     var drawer by remember { mutableStateOf(false) }
     val pager = rememberPagerState { pages.size.coerceAtLeast(1) }
     LaunchedEffect(homeTick) { drawer = false; pager.scrollToPage(0) }
     BackHandler(drawer) { drawer = false }
+
+    val drag = remember { DragState() }
+    val cellBounds = remember { mutableMapOf<String, Rect>() }
+    var menu by remember { mutableStateOf<Pair<App, Rect>?>(null) }
+
+    SideEffect {
+        drag.onEnd = { a ->
+            if (!drag.moved) {
+                menu = a to drag.srcBounds
+            } else if (drag.src == "home") {
+                val p = drag.pos
+                val tk = cellBounds.entries.firstOrNull { it.value.contains(p) && it.key != appKey(a) }?.key
+                val t = tk?.let { k -> layout.firstOrNull { appKey(it) == k } }
+                val last = pages.getOrNull(pager.currentPage)?.lastOrNull()
+                val nl = when {
+                    t != null -> moveApp(layout, a, t)
+                    last != null && last != a -> moveAfter(layout, a, last)
+                    else -> layout
+                }
+                layout = nl
+                prefs.edit().putString("order", nl.joinToString("\n") { appKey(it) }).apply()
+            }
+        }
+    }
+
+    // hold an icon near the screen edge to flip pages
+    val edgePx = with(density) { 48.dp.toPx() }
+    val screenW = with(density) { conf.screenWidthDp.dp.toPx() }
+    LaunchedEffect(drag.app != null) {
+        while (drag.app != null) {
+            if (drag.moved && drag.src == "home" && !drawer) {
+                val x = drag.pos.x
+                if (x < edgePx && pager.currentPage > 0) { pager.animateScrollToPage(pager.currentPage - 1); delay(600) }
+                else if (x > screenW - edgePx && pager.currentPage < pager.pageCount - 1) { pager.animateScrollToPage(pager.currentPage + 1); delay(600) }
+            }
+            delay(80)
+        }
+    }
 
     val blur by animateFloatAsState(if (drawer) DRAWER_BLUR_DP else 0f, tween(300), label = "blur")
     SideEffect {
@@ -226,7 +341,7 @@ fun Launcher(homeTick: Int) {
                 Column(Modifier.fillMaxSize()) {
                     rows.forEach { row ->
                         Row(Modifier.fillMaxWidth().weight(1f)) {
-                            row.forEach { AppCell(it, Modifier.weight(1f).fillMaxHeight()) }
+                            row.forEach { AppCell(it, drag, "home", Modifier.weight(1f).fillMaxHeight(), cellBounds = cellBounds) }
                             repeat(CELLS_X - row.size) { Spacer(Modifier.weight(1f)) }
                         }
                     }
@@ -248,7 +363,7 @@ fun Launcher(homeTick: Int) {
                     .clip(RoundedCornerShape(30.dp)).background(Color.White.copy(alpha = 0.22f))
                     .padding(vertical = 12.dp)
             ) {
-                Row(Modifier.fillMaxWidth()) { dock.forEach { AppCell(it, Modifier.weight(1f), showLabel = false) } }
+                Row(Modifier.fillMaxWidth()) { dock.forEach { AppCell(it, drag, "dock", Modifier.weight(1f), showLabel = false) } }
             }
         }
 
@@ -262,7 +377,45 @@ fun Launcher(homeTick: Int) {
                 Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.35f)).windowInsetsPadding(WindowInsets.systemBars),
                 contentPadding = PaddingValues(12.dp, 24.dp)
             ) {
-                items(apps, key = { it.pkg + it.cls }) { AppCell(it, Modifier.padding(vertical = 10.dp)) }
+                items(apps, key = { appKey(it) }) { AppCell(it, drag, "drawer", Modifier.padding(vertical = 10.dp)) }
+            }
+        }
+
+        // icon following the finger while moving
+        drag.app?.let { a ->
+            if (drag.moved) {
+                Image(
+                    a.icon, null,
+                    Modifier.offset { IntOffset((drag.pos.x - iconPx / 2).toInt(), (drag.pos.y - iconPx / 2).toInt()) }
+                        .size(ICON_DP.dp).graphicsLayer { scaleX = 1.12f; scaleY = 1.12f; alpha = 0.95f }
+                )
+            }
+        }
+
+        // long-press (without moving) menu
+        menu?.let { (a, r) ->
+            val h = with(density) { conf.screenHeightDp.dp.toPx() }
+            val y = if (r.bottom > h * 0.65f) r.top - with(density) { 110.dp.toPx() } else r.bottom
+            val x = r.left.coerceAtMost(screenW - with(density) { 190.dp.toPx() })
+            Popup(
+                alignment = Alignment.TopStart, offset = IntOffset(x.toInt(), y.toInt()),
+                onDismissRequest = { menu = null }, properties = PopupProperties(focusable = true)
+            ) {
+                Column(Modifier.clip(RoundedCornerShape(20.dp)).background(Color(0xE61C1C1E)).padding(vertical = 6.dp)) {
+                    MenuItem("App info") {
+                        menu = null
+                        ctx.startActivity(
+                            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${a.pkg}"))
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    }
+                    MenuItem("Uninstall") {
+                        menu = null
+                        ctx.startActivity(
+                            Intent(Intent.ACTION_DELETE, Uri.parse("package:${a.pkg}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    }
+                }
             }
         }
     }
